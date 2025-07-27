@@ -1,0 +1,97 @@
+---
+- name: Gather LVM information for extension planning
+  hosts: "{{ target_vm_host }}"
+  gather_facts: true
+  become: yes
+  vars:
+    target_vm_host: ""  # Hostname/IP of the VM to analyze
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg: "Please provide target_vm_host (hostname or IP of the VM)"
+      when: target_vm_host is not defined or target_vm_host == ""
+
+    - name: Get all block devices
+      ansible.builtin.shell: |
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
+      register: all_block_devices
+
+    - name: Get volume group information
+      ansible.builtin.shell: |
+        vgs --noheadings -o vg_name,vg_size,vg_free,pv_count | sed 's/^[ \t]*//'
+      register: vg_info
+      ignore_errors: yes
+
+    - name: Get logical volume information
+      ansible.builtin.shell: |
+        lvs --noheadings -o vg_name,lv_name,lv_size,lv_path | sed 's/^[ \t]*//'
+      register: lv_info
+      ignore_errors: yes
+
+    - name: Get physical volume information
+      ansible.builtin.shell: |
+        pvs --noheadings -o pv_name,vg_name,pv_size,pv_free | sed 's/^[ \t]*//'
+      register: pv_info
+      ignore_errors: yes
+
+    - name: Get filesystem mount information
+      ansible.builtin.shell: |
+        df -h | grep -E '^/dev/'
+      register: filesystem_info
+
+    - name: Get recently attached disks (likely candidates for extension)
+      ansible.builtin.shell: |
+        # Find disks that have no partitions at all
+        lsblk -rno NAME,TYPE | awk '$2=="disk"' | while read disk rest; do
+          # Check if this disk has any child partitions
+          if ! lsblk -rno NAME "/dev/$disk" | grep -v "^$disk$" | grep -q .; then
+            echo "/dev/$disk"
+          fi
+        done
+      register: unformatted_disks
+
+    - name: Display all block devices
+      ansible.builtin.debug:
+        msg: "{{ (['==========================================', '         ALL BLOCK DEVICES', '=========================================='] + all_block_devices.stdout_lines) }}"
+
+    - name: Display volume group information
+      ansible.builtin.debug:
+        msg: "{{ (['==========================================', '         VOLUME GROUPS', '==========================================', 'VG_NAME VG_SIZE VG_FREE PV_COUNT'] + (vg_info.stdout_lines if vg_info.stdout else ['No LVM volume groups found'])) }}"
+
+    - name: Display logical volume information
+      ansible.builtin.debug:
+        msg: "{{ (['==========================================', '         LOGICAL VOLUMES', '==========================================', 'VG_NAME LV_NAME LV_SIZE LV_PATH'] + (lv_info.stdout_lines if lv_info.stdout else ['No LVM logical volumes found'])) }}"
+
+    - name: Display physical volume information
+      ansible.builtin.debug:
+        msg: "{{ (['==========================================', '         PHYSICAL VOLUMES', '==========================================', 'PV_NAME VG_NAME PV_SIZE PV_FREE'] + (pv_info.stdout_lines if pv_info.stdout else ['No LVM physical volumes found'])) }}"
+
+    - name: Display mounted filesystems
+      ansible.builtin.debug:
+        msg: "{{ (['==========================================', '         MOUNTED FILESYSTEMS', '=========================================='] + filesystem_info.stdout_lines) }}"
+
+    - name: Display unformatted disks
+      ansible.builtin.debug:
+        msg: "{{ (['==========================================', '         UNFORMATTED DISKS', '=========================================='] + (unformatted_disks.stdout_lines if unformatted_disks.stdout else ['No unformatted disks found'])) }}"
+
+    - name: Display usage instructions
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "              NEXT STEPS"
+          - "=========================================="
+          - ""
+          - "To extend an LVM volume with a new disk:"
+          - ""
+          - "1. Identify the volume group and logical volume you want to extend from the info above"
+          - "2. Identify the unformatted disk you want to add from the 'UNFORMATTED DISKS' section"
+          - "3. Find the mount point for your logical volume from the 'MOUNTED FILESYSTEMS' section"
+          - "4. Run the LVM extend playbook with these inputs:"
+          - ""
+          - "Required variables for LVM extend playbook:"
+          - "  target_vm_host: [this VM's hostname/IP]"
+          - "  volume_group_name: [VG name from VOLUME GROUPS section]"
+          - "  logical_volume_name: [LV name from LOGICAL VOLUMES section]"
+          - "  mount_point: [mount point from MOUNTED FILESYSTEMS section]"
+          - "  new_disk_device: [device path from UNFORMATTED DISKS section]"

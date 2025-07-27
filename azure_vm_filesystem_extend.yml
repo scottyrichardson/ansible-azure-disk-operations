@@ -1,0 +1,166 @@
+---
+- name: Extend LVM with newly attached disk
+  hosts: "{{ target_vm_host }}"
+  gather_facts: false
+  become: yes
+  vars:
+    # Required inputs
+    volume_group_name: "vg_data"     # Name of the existing volume group to extend
+    logical_volume_name: "lv_data"   # Name of the existing logical volume to extend
+    mount_point: "/data"             # Mount point of the logical volume
+    target_vm_host: ""               # Hostname/IP of the VM to connect to
+    new_disk_device: ""              # Device path of the new disk (e.g., /dev/sde)
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg: "Required variables missing. Please provide: volume_group_name, logical_volume_name, mount_point, target_vm_host, and new_disk_device"
+      when: 
+        - volume_group_name is not defined or volume_group_name == ""
+        - logical_volume_name is not defined or logical_volume_name == ""
+        - mount_point is not defined or mount_point == ""
+        - target_vm_host is not defined or target_vm_host == ""
+        - new_disk_device is not defined or new_disk_device == ""
+
+    - name: Verify new device exists and get size
+      ansible.builtin.shell: |
+        if [ -b "{{ new_disk_device }}" ]; then
+          lsblk {{ new_disk_device }} --noheadings --output SIZE
+        else
+          echo "Device not found"
+          exit 1
+        fi
+      register: device_verification
+
+    - name: Display new device information
+      ansible.builtin.debug:
+        msg: 
+          - "New device: {{ new_disk_device }}"
+          - "Device size: {{ device_verification.stdout.strip() }}"
+
+    - name: Check if device needs partitioning
+      ansible.builtin.shell: |
+        if lsblk {{ new_disk_device }} --noheadings --output TYPE | grep -q part; then
+          echo "has_partitions"
+        else
+          echo "no_partitions"
+        fi
+      register: partition_check
+
+    - name: Create partition on new disk if needed
+      ansible.builtin.shell: |
+        parted {{ new_disk_device }} --script mklabel gpt
+        parted {{ new_disk_device }} --script mkpart primary 0% 100%
+      when: partition_check.stdout == "no_partitions"
+
+    - name: Set device path for PV creation
+      ansible.builtin.set_fact:
+        pv_device: "{{ new_disk_device }}{{ '1' if partition_check.stdout == 'no_partitions' else '' }}"
+
+    - name: Wait for partition to be available
+      ansible.builtin.wait_for:
+        path: "{{ pv_device }}"
+        timeout: 30
+      when: partition_check.stdout == "no_partitions"
+
+    - name: Create physical volume on new device
+      ansible.builtin.shell: |
+        pvcreate {{ pv_device }}
+      register: pv_create_result
+
+    - name: Verify volume group exists
+      ansible.builtin.shell: |
+        vgs {{ volume_group_name }}
+      register: vg_check
+
+    - name: Verify logical volume exists
+      ansible.builtin.shell: |
+        lvs /dev/{{ volume_group_name }}/{{ logical_volume_name }}
+      register: lv_check
+
+    - name: Get current LVM state before extension
+      ansible.builtin.shell: |
+        echo "=== Before Extension ==="
+        echo "Volume Group Info:"
+        vgs {{ volume_group_name }}
+        echo ""
+        echo "Logical Volume Info:"
+        lvs /dev/{{ volume_group_name }}/{{ logical_volume_name }}
+        echo ""
+        echo "Filesystem Info:"
+        df -h {{ mount_point }}
+      register: before_lvm_state
+
+    - name: Display current state
+      ansible.builtin.debug:
+        msg: "{{ before_lvm_state.stdout }}"
+
+    - name: Extend volume group with new physical volume
+      ansible.builtin.shell: |
+        vgextend {{ volume_group_name }} {{ pv_device }}
+      register: vg_extend_result
+
+    - name: Extend logical volume using all free space
+      ansible.builtin.shell: |
+        lvextend -l +100%FREE /dev/{{ volume_group_name }}/{{ logical_volume_name }}
+      register: lv_extend_result
+
+    - name: Detect filesystem type
+      ansible.builtin.shell: |
+        blkid -o value -s TYPE /dev/{{ volume_group_name }}/{{ logical_volume_name }}
+      register: fs_type_result
+
+    - name: Resize filesystem
+      ansible.builtin.shell: |
+        case {{ fs_type_result.stdout }} in
+          ext2|ext3|ext4)
+            resize2fs /dev/{{ volume_group_name }}/{{ logical_volume_name }}
+            ;;
+          xfs)
+            xfs_growfs {{ mount_point }}
+            ;;
+          *)
+            echo "Unsupported filesystem type: {{ fs_type_result.stdout }}"
+            exit 1
+            ;;
+        esac
+      register: fs_resize_result
+
+    - name: Get final LVM and filesystem state
+      ansible.builtin.shell: |
+        echo "=== After Extension ==="
+        echo "Volume Group Info:"
+        vgs {{ volume_group_name }}
+        echo ""
+        echo "Logical Volume Info:"
+        lvs /dev/{{ volume_group_name }}/{{ logical_volume_name }}
+        echo ""
+        echo "Physical Volume Info:"
+        pvs | grep {{ volume_group_name }}
+        echo ""
+        echo "Filesystem Info:"
+        df -h {{ mount_point }}
+      register: final_lvm_state
+
+    - name: Display LVM extension results
+      ansible.builtin.debug:
+        msg:
+          - "=== LVM Extension Completed Successfully ==="
+          - "Added physical volume: {{ pv_device }}"
+          - "Extended volume group: {{ volume_group_name }}"
+          - "Extended logical volume: {{ logical_volume_name }}"
+          - "Filesystem type: {{ fs_type_result.stdout }}"
+          - ""
+          - "{{ final_lvm_state.stdout }}"
+
+    - name: Verify extension by checking available space
+      ansible.builtin.shell: |
+        df {{ mount_point }} | tail -1 | awk '{print $4}'
+      register: available_space
+
+    - name: Display success summary
+      ansible.builtin.debug:
+        msg:
+          - "LVM extension completed successfully!"
+          - "Available space in {{ mount_point }}: {{ available_space.stdout }} KB"
+          - "The filesystem has been automatically resized to use the new space."

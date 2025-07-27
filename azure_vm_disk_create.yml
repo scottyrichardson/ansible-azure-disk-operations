@@ -1,0 +1,100 @@
+---
+- name: Create disk for Azure VM
+  hosts: localhost
+  gather_facts: false
+  vars:
+    resource_group: "vm-resource-group"
+    vm_name: "vm-name"
+    disk_size_gb: 4096
+    disk_type: "Premium_LRS" # Options: Standard_LRS, StandardSSD_LRS, Premium_LRS, StandardSSD_LRS, UltraSSD_LRS
+    des_name: "" # Optional name of an existing disk encryption set if applicable
+
+  tasks:
+    - name: Get VM Resource Group information
+      azure.azcollection.azure_rm_resourcegroup_info:
+        name: "{{ resource_group }}"
+      register: rg_info
+
+    - name: Get VM Subscription ID
+      ansible.builtin.set_fact:
+        subscription_id: "{{ rg_info.resourcegroups[0].id.split('/')[2] }}"
+
+    - name: Login to Azure CLI
+      ansible.builtin.command: >
+        az login --service-principal
+        -u {{ lookup('env', 'AZURE_CLIENT_ID') }}
+        -p '{{ lookup('env', 'AZURE_SECRET') }}'
+        --tenant "{{ lookup('env', 'AZURE_TENANT') }}"
+      no_log: true
+      changed_when: false
+
+    - name: Set Azure subscription
+      ansible.builtin.command: >
+        az account set --subscription "{{ subscription_id }}"
+      no_log: true
+      changed_when: false
+
+    - name: Get current VM configuration
+      azure.azcollection.azure_rm_virtualmachine_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}"
+      register: vm_info
+
+    - name: Extract VM zone and location information
+      ansible.builtin.set_fact:
+        vm_zone: "{{ vm_info.vms[0].zones[0] if vm_info.vms[0].zones is defined and vm_info.vms[0].zones | length > 0 else '' }}"
+        vm_location: "{{ vm_info.vms[0].location }}"
+
+    - name: Display VM information
+      ansible.builtin.debug:
+        msg:
+          - "VM location: {{ vm_location }}"
+          - "VM zone: {{ vm_zone if vm_zone != '' else 'No zone (regional)' }}"
+
+    - name: Calculate next available LUN
+      ansible.builtin.set_fact:
+        next_available_lun: "{{ (vm_info.vms[0].data_disks | map(attribute='lun') | list | max | default(-1)) + 1 }}"
+
+    - name: Generate random number
+      ansible.builtin.set_fact:
+        random_number: "{{ range(100, 999) | random }}"
+
+    - name: Generate disk name
+      ansible.builtin.set_fact:
+        disk_name: "{{ vm_name }}-data-disk-{{ next_available_lun | int }}-{{ disk_size_gb }}gb-{{ random_number }}"
+
+    - name: Get disk encryption set ID
+      azure.azcollection.azure_rm_diskencryptionset_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ des_name }}"
+      register: des_info
+      when: des_name is defined and des_name != ""
+
+    - name: Create managed disk via CLI
+      ansible.builtin.command: >
+        az disk create
+        --resource-group "{{ resource_group }}"
+        --name "{{ disk_name }}"
+        --location "{{ vm_location }}"
+        --size-gb "{{ disk_size_gb }}"
+        --sku "{{ disk_type }}"
+        {{ '--disk-encryption-set "' + des_info.diskencryptionsets[0].id + '"' if des_name is defined and des_name != '' else '' }}
+        {{ '--zone "' + vm_zone + '"' if vm_zone != '' else '' }}
+      register: disk_creation_result
+      changed_when: true
+
+    - name: Get disk information
+      azure.azcollection.azure_rm_manageddisk_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ disk_name }}"
+      register: new_disk
+
+    - name: Display disk creation results
+      ansible.builtin.debug:
+        msg:
+          - "Disk {{ new_disk.ansible_info.azure_managed_disk[0].name }} created successfully"
+          - "Disk ID: {{ new_disk.ansible_info.azure_managed_disk[0].id }}"
+          - "Zone: {{ new_disk.ansible_info.azure_managed_disk[0].zone if new_disk.ansible_info.azure_managed_disk[0].zone else 'Regional (no zone)' }}"
+          - "Storage Type: {{ new_disk.ansible_info.azure_managed_disk[0].storage_account_type }}"
+          - "Size: {{ new_disk.ansible_info.azure_managed_disk[0].disk_size_gb }}GB"
+          - "Status: Ready for attachment"

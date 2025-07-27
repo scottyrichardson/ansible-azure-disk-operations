@@ -1,0 +1,109 @@
+---
+- name: Attach disk to Azure VM
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Required inputs
+    resource_group: "vm-resource-group" # Resource group containing the VM and disk
+    vm_name: "vm-name" # Name of the VM to attach disk to
+    disk_name: "" # Name of the existing disk to attach
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg: "Required variables missing. Please provide: resource_group, vm_name, and disk_name"
+      when:
+        - resource_group is not defined or resource_group == ""
+        - vm_name is not defined or vm_name == ""
+        - disk_name is not defined or disk_name == ""
+
+    - name: Login to Azure CLI
+      ansible.builtin.command: >
+        az login --service-principal
+        -u {{ lookup('env', 'AZURE_CLIENT_ID') }}
+        -p '{{ lookup('env', 'AZURE_SECRET') }}'
+        --tenant "{{ lookup('env', 'AZURE_TENANT') }}"
+      no_log: true
+      changed_when: false
+
+    - name: Get VM Resource Group information
+      azure.azcollection.azure_rm_resourcegroup_info:
+        name: "{{ resource_group }}"
+      register: rg_info
+
+    - name: Get VM Subscription ID
+      ansible.builtin.set_fact:
+        subscription_id: "{{ rg_info.resourcegroups[0].id.split('/')[2] }}"
+
+    - name: Set Azure subscription
+      ansible.builtin.command: >
+        az account set --subscription "{{ subscription_id }}"
+      no_log: true
+      changed_when: false
+
+    - name: Verify disk exists
+      azure.azcollection.azure_rm_manageddisk_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ disk_name }}"
+      register: disk_check
+
+    - name: Verify VM exists
+      azure.azcollection.azure_rm_virtualmachine_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}"
+      register: vm_check
+
+    - name: Calculate next available LUN
+      ansible.builtin.set_fact:
+        next_available_lun: "{{ (vm_check.vms[0].data_disks | map(attribute='lun') | list | max | default(-1)) + 1 }}"
+
+    - name: Display attachment information
+      ansible.builtin.debug:
+        msg:
+          - "Attaching disk: {{ disk_name }}"
+          - "To VM: {{ vm_name }}"
+          - "Resource Group: {{ resource_group }}"
+          - "Next available LUN: {{ next_available_lun }}"
+
+    - name: Attach disk to VM
+      ansible.builtin.command: >
+        az vm disk attach
+        --resource-group "{{ resource_group }}"
+        --vm-name "{{ vm_name }}"
+        --name "{{ disk_name }}"
+        --lun "{{ next_available_lun }}"
+      register: attach_result
+      changed_when: true
+
+    - name: Get updated VM information
+      azure.azcollection.azure_rm_virtualmachine_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}"
+      register: updated_vm_info
+
+    - name: Get attached disk information
+      azure.azcollection.azure_rm_manageddisk_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ disk_name }}"
+      register: attached_disk_info
+
+    - name: Display attachment results
+      ansible.builtin.debug:
+        msg:
+          - "Disk attachment completed successfully!"
+          - "Disk {{ disk_name }} attached to {{ vm_name }}"
+          - "LUN: {{ next_available_lun }}"
+          - "Disk ID: {{ attached_disk_info.ansible_info.azure_managed_disk[0].id }}"
+          - "Zone: {{ attached_disk_info.ansible_info.azure_managed_disk[0].zone if attached_disk_info.ansible_info.azure_managed_disk[0].zone else 'Regional (no zone)' }}"
+          - "Storage Type: {{ attached_disk_info.ansible_info.azure_managed_disk[0].storage_account_type }}"
+          - "Size: {{ attached_disk_info.ansible_info.azure_managed_disk[0].disk_size_gb }}GB"
+
+    - name: Display next steps
+      ansible.builtin.debug:
+        msg:
+          - "Disk attachment completed!"
+          - "The disk should now be available in the VM at LUN {{ next_available_lun }}"
+          - "On the VM, you can find it at:"
+          - "  - /dev/disk/azure/scsi1/lun{{ next_available_lun }}"
+          - "  - Or likely as /dev/sd{{ 'abcdefghijklmnopqrstuvwxyz'[3 + next_available_lun | int] }}"
+          - "Run 'lsblk' on the VM to see all attached disks"
