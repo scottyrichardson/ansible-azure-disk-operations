@@ -1,0 +1,72 @@
+---
+- name: Generate SAS token for Azure disk
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Azure variables
+    subscription_id: "227a5bab-c45d-49e4-9ac1-e21c056d5f14" # Subscription ID containing the disk
+    resource_group: "ansible-testing" # Resource group containing the disk
+    disk_name: "bsc-disk-state-test" # Name of the existing disk to generate SAS for
+
+    # SAS token parameters
+    sas_duration_seconds: 5184000 # Max allowed by Azure is 5184000 seconds (60 days)
+    sas_access_level: "read" # Options: read, write
+
+  tasks:
+    - name: Ensure required variables are defined
+      ansible.builtin.fail:
+        msg: "Required variable {{ item }} is not defined"
+      when: vars[item] is not defined or vars[item] == ""
+      loop:
+        - subscription_id
+        - resource_group
+        - disk_name
+
+    - name: Get disk information
+      azure.azcollection.azure_rm_manageddisk_info:
+        subscription_id: "{{ subscription_id }}"
+        resource_group: "{{ resource_group }}"
+        name: "{{ disk_name }}"
+      register: disk_info
+
+    - name: Verify disk exists
+      ansible.builtin.fail:
+        msg: "Disk {{ disk_name }} not found in resource group {{ resource_group }}"
+      when: disk_info.ansible_info.azure_managed_disk | length == 0
+
+    - name: Check if disk already has an active SAS token
+      azure.azcollection.azure_rm_resource:
+        subscription_id: "{{ subscription_id }}"
+        resource_group: "{{ resource_group }}"
+        provider: compute
+        resource_type: disks
+        resource_name: "{{ disk_name }}"
+        api_version: "2023-04-02"
+        method: GET
+      register: disk_status
+
+    - name: Verify disk is not already being accessed
+      ansible.builtin.fail:
+        msg: "Disk {{ disk_name }} already has an active SAS token or is currently being accessed"
+      when: disk_status.response.properties.diskState is defined and disk_status.response.properties.diskState != "Unattached"
+
+    - name: Generate SAS token for disk access
+      azure.azcollection.azure_rm_resource:
+        url: "https://management.azure.com/subscriptions/{{ subscription_id }}/resourceGroups/{{ resource_group }}/providers/Microsoft.Compute/disks/{{ disk_name }}/beginGetAccess"
+        api_version: "2023-04-02"
+        method: POST
+        body:
+          durationInSeconds: "{{ sas_duration_seconds }}"
+          access: "{{ sas_access_level }}"
+      register: sas_response
+
+    - name: Display SAS token information
+      ansible.builtin.debug:
+        msg: |
+          SAS Token generated successfully!
+          Disk: {{ disk_name }}
+          Resource Group: {{ resource_group }}
+          Access Level: {{ sas_access_level }}
+          Duration: {{ sas_duration_seconds }} seconds
